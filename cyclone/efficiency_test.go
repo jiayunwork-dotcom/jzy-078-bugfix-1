@@ -1,7 +1,10 @@
 package cyclone
 
 import (
+	"fmt"
 	"math"
+	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -197,6 +200,85 @@ func TestDistributionNormalizesNonUnitWeights(t *testing.T) {
 	}
 	if math.Abs(res.OverallEfficiency-resNorm.OverallEfficiency) > 1e-12 {
 		t.Errorf("normalization changed result: %.10f vs %.10f", res.OverallEfficiency, resNorm.OverallEfficiency)
+	}
+}
+
+// Warnings attached to a result must describe that result's own distribution,
+// no matter how many evaluations run concurrently. Regression test for the
+// shared backing array behind the empty Stokes warning list: concurrent
+// appends to it let one request's normalization warning overwrite another's.
+func TestDistributionWarningsAreRequestScoped(t *testing.T) {
+	in := baselineInput()
+	sums := []float64{20, 30, 40, 50, 60, 70, 80, 90}
+
+	binsFor := func(sum float64) []DistributionBin {
+		// Five bins of equal weight; sum/5 is exact for these totals, so the
+		// weight sum is exactly sum and the warning text is deterministic.
+		diameters := []float64{1e-6, 3e-6, 8e-6, 20e-6, 60e-6}
+		bins := make([]DistributionBin, len(diameters))
+		for i, d := range diameters {
+			bins[i] = DistributionBin{Diameter: d, Weight: sum / 5}
+		}
+		return bins
+	}
+
+	// Golden results computed serially before any concurrency: concurrent
+	// evaluations must reproduce them field for field.
+	goldens := make(map[float64]DistributionResult, len(sums)+1)
+	for _, sum := range append(append([]float64{}, sums...), 1) {
+		res, err := EvaluateDistribution(in, binsFor(sum))
+		if err != nil {
+			t.Fatalf("serial evaluation for sum %v failed: %v", sum, err)
+		}
+		goldens[sum] = res
+	}
+	if len(goldens[1].Warnings) != 0 {
+		t.Fatalf("unit-sum distribution must carry no warnings, got %v", goldens[1].Warnings)
+	}
+
+	const iterations = 200
+	errs := make(chan string, 4096)
+	var wg sync.WaitGroup
+	for _, sum := range append(append([]float64{}, sums...), 1) {
+		wg.Add(1)
+		go func(sum float64) {
+			defer wg.Done()
+			golden := goldens[sum]
+			for i := 0; i < iterations; i++ {
+				res, err := EvaluateDistribution(in, binsFor(sum))
+				if err != nil {
+					errs <- err.Error()
+					return
+				}
+				if res.WeightSum != sum {
+					errs <- fmt.Sprintf("sum %v: weight sum = %v", sum, res.WeightSum)
+					return
+				}
+				if sum == 1 {
+					if len(res.Warnings) != 0 {
+						errs <- fmt.Sprintf("unit-sum distribution gained warnings: %v", res.Warnings)
+						return
+					}
+				} else {
+					want := "bin weights sum to " + trimFloat(sum) +
+						", not 1; results were computed after normalization"
+					if len(res.Warnings) != 1 || res.Warnings[0] != want {
+						errs <- fmt.Sprintf("sum %v: warnings = %v, want [%q]",
+							sum, res.Warnings, want)
+						return
+					}
+				}
+				if !reflect.DeepEqual(res, golden) {
+					errs <- fmt.Sprintf("sum %v: concurrent result differs from serial golden", sum)
+					return
+				}
+			}
+		}(sum)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
 	}
 }
 

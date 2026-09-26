@@ -89,14 +89,15 @@ func particleReynolds(in BaseInput, d float64) float64 {
 	return in.GasDensity * terminal * d / in.GasViscosity
 }
 
-// noWarnings is the shared empty warning list for the common Stokes case, so
-// clients always receive [] rather than null.
-var noWarnings = make([]string, 0, 4)
-
+// classifyReynolds always returns a freshly allocated warning list: callers
+// may append their own warnings to it, so no slice (or its backing array) may
+// ever be shared between calls — that would leak one request's warnings into
+// another concurrent request. The empty Stokes list is non-nil so clients
+// always receive [] rather than null.
 func classifyReynolds(re float64) (regime string, stokesValid bool, warnings []string) {
 	switch {
 	case re <= reynoldsStokesLimit:
-		return RegimeStokes, true, noWarnings
+		return RegimeStokes, true, make([]string, 0)
 	case re <= reynoldsNewtonLimit:
 		warnings = []string{
 			"particle Reynolds number at d50 is " + trimFloat(re) +

@@ -3,8 +3,12 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
 	"cycloneservice/cyclone"
@@ -130,6 +134,144 @@ func TestDistributionEndpoint(t *testing.T) {
 	bins := body["bins"].([]any)
 	if len(bins) != 3 {
 		t.Errorf("got %d bins, want 3", len(bins))
+	}
+}
+
+// Many clients posting distributions with different weight totals at the same
+// time must each get a response that describes only their own request, and
+// every concurrent response must be byte-identical to the serial one.
+// Regression test for warnings leaking across requests through shared state.
+func TestDistributionEndpointConcurrentClientsMatchSerial(t *testing.T) {
+	srv := httptest.NewServer(NewRouter())
+	defer srv.Close()
+	url := srv.URL + "/api/v1/cyclone/distribution-efficiency"
+	client := &http.Client{}
+
+	sums := []float64{20, 30, 40, 50, 60, 70, 80, 90}
+	allSums := append(append([]float64{}, sums...), 1) // 1 = pre-normalized feed
+
+	payloadFor := func(sum float64) map[string]any {
+		payload := baseParams()
+		diameters := []float64{1e-6, 3e-6, 8e-6, 20e-6, 60e-6}
+		bins := make([]map[string]any, len(diameters))
+		for i, d := range diameters {
+			// sum/5 is exact for these totals, so weight_sum is exactly sum.
+			bins[i] = map[string]any{"diameter_m": d, "weight": sum / 5}
+		}
+		payload["bins"] = bins
+		return payload
+	}
+
+	post := func(payload map[string]any) (string, error) {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return "", err
+		}
+		resp, err := client.Post(url, "application/json", bytes.NewReader(raw))
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("status %d: %s", resp.StatusCode, body)
+		}
+		return string(body), nil
+	}
+
+	// Serial pass: record the golden response body per distribution and pin
+	// the warning contract — the warning must quote this distribution's own
+	// weight sum, nobody else's; a unit-sum feed must not warn at all.
+	golden := make(map[float64]string, len(allSums))
+	for _, sum := range allSums {
+		body, err := post(payloadFor(sum))
+		if err != nil {
+			t.Fatalf("serial request for sum %v: %v", sum, err)
+		}
+		golden[sum] = body
+
+		if !strings.Contains(body, fmt.Sprintf(`"weight_sum":%v`, sum)) {
+			t.Errorf("sum %v: response reports a different weight_sum: %s", sum, body)
+		}
+		if sum == 1 {
+			if strings.Contains(body, "bin weights sum to") {
+				t.Errorf("unit-sum distribution must not warn, got: %s", body)
+			}
+			continue
+		}
+		if !strings.Contains(body, fmt.Sprintf("bin weights sum to %v, not 1", sum)) {
+			t.Errorf("sum %v: warning missing or quotes another sum: %s", sum, body)
+		}
+		for _, other := range sums {
+			if other != sum && strings.Contains(body, fmt.Sprintf("bin weights sum to %v,", other)) {
+				t.Errorf("sum %v: response carries sum %v's warning: %s", sum, other, body)
+			}
+		}
+	}
+
+	// Concurrent storm: several clients per distribution, each looping. Every
+	// single response must equal the serial golden byte for byte.
+	const clientsPerSum = 2
+	const iterations = 100
+	errs := make(chan string, 4096)
+	var wg sync.WaitGroup
+	for _, sum := range allSums {
+		for c := 0; c < clientsPerSum; c++ {
+			wg.Add(1)
+			go func(sum float64) {
+				defer wg.Done()
+				payload := payloadFor(sum)
+				for i := 0; i < iterations; i++ {
+					body, err := post(payload)
+					if err != nil {
+						errs <- fmt.Sprintf("sum %v: %v", sum, err)
+						return
+					}
+					if body != golden[sum] {
+						errs <- fmt.Sprintf("sum %v: concurrent response diverged from serial:\n got: %s\nwant: %s",
+							sum, body, golden[sum])
+						return
+					}
+				}
+			}(sum)
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Error(e)
+	}
+}
+
+// The warnings field must always serialize as a JSON array — [] when empty,
+// never null — regardless of regime or endpoint.
+func TestWarningsSerializeAsEmptyArray(t *testing.T) {
+	r := NewRouter()
+
+	// Stokes-regime, unit-sum distribution.
+	payload := baseParams()
+	payload["bins"] = []map[string]any{{"diameter_m": 8e-6, "weight": 1.0}}
+	w, _ := postJSON(t, r, "/api/v1/cyclone/distribution-efficiency", payload)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"warnings":[]`) {
+		t.Errorf("distribution warnings should serialize as [], got: %s", w.Body.String())
+	}
+
+	w2, _ := postJSON(t, r, "/api/v1/cyclone/cut-point", baseParams())
+	if !strings.Contains(w2.Body.String(), `"warnings":[]`) {
+		t.Errorf("cut-point warnings should serialize as [], got: %s", w2.Body.String())
+	}
+
+	g := baseParams()
+	g["particle_diameter_m"] = 8e-6
+	w3, _ := postJSON(t, r, "/api/v1/cyclone/grade-efficiency", g)
+	if !strings.Contains(w3.Body.String(), `"warnings":[]`) {
+		t.Errorf("grade warnings should serialize as [], got: %s", w3.Body.String())
 	}
 }
 

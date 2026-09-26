@@ -124,12 +124,18 @@ func EvaluateDistribution(in BaseInput, bins []DistributionBin) (DistributionRes
 		return DistributionResult{}, newError(ErrInvalidDist, "bins.weight", "sum of bin weights must be greater than zero")
 	}
 
+	// Copy the cut-point warnings into a list this result owns: appending the
+	// normalization warning must never write into a slice (or backing array)
+	// shared with other in-flight requests.
+	warnings := make([]string, 0, len(cp.Warnings)+1)
+	warnings = append(warnings, cp.Warnings...)
+
 	result := DistributionResult{
 		CutDiameter50:   cp.CutDiameter50,
 		CutDiameter50Um: cp.CutDiameter50Um,
 		WeightSum:       weightSum,
 		Bins:            make([]BinEfficiency, 0, len(bins)),
-		Warnings:        cp.Warnings,
+		Warnings:        warnings,
 	}
 	if math.Abs(weightSum-1.0) > distributionWeightTolerance {
 		result.Warnings = append(result.Warnings,
